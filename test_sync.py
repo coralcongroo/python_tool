@@ -20,6 +20,7 @@ test_sync.py - UDP 多设备 LED 同步系统主机端测试工具
 """
 
 import argparse
+import gc
 import math
 import socket
 import struct
@@ -68,22 +69,104 @@ def pack_packet(seq: int, master_us: int, mode: int, speed: float,
                        SYNC_MAGIC, seq, master_us, speed,
                        mode, brightness, r, g, b)
 
-def pack_pixel_packet(seq: int, frame_us: int, rgb_list: list) -> bytes:
+def pack_pixel_packet(seq: int, frame_us: int, rgb_data) -> bytes:
     """
     Build a pixel-push UDP packet.
-    rgb_list: list of (r, g, b) tuples, one per LED.
+    rgb_data: bytes/bytearray/memoryview of raw RGB bytes, or list of (r,g,b).
     Wire format: PIXEL_HDR_FMT + raw RGB bytes
     """
-    led_count = len(rgb_list)
+    if isinstance(rgb_data, (bytes, bytearray, memoryview)):
+        raw_bytes = bytes(rgb_data)
+        if len(raw_bytes) % 3 != 0:
+            raise ValueError("raw rgb byte length must be multiple of 3")
+        led_count = len(raw_bytes) // 3
+        if led_count > 65535:
+            raise ValueError("led_count must be <= 65535 for uint16 packet field")
+        hdr = struct.pack(PIXEL_HDR_FMT, PIXEL_MAGIC, seq, frame_us, led_count)
+        return hdr + raw_bytes
+
+    led_count = len(rgb_data)
     if led_count > 65535:
         raise ValueError("led_count must be <= 65535 for uint16 packet field")
     hdr = struct.pack(PIXEL_HDR_FMT, PIXEL_MAGIC, seq, frame_us, led_count)
     raw = bytearray(led_count * 3)
-    for i, (r, g, b) in enumerate(rgb_list):
+    for i, (r, g, b) in enumerate(rgb_data):
         raw[i * 3]     = r & 0xFF
         raw[i * 3 + 1] = g & 0xFF
         raw[i * 3 + 2] = b & 0xFF
     return hdr + bytes(raw)
+
+
+def render_frame_bytes(effect: str, t_rel: float, led_count: int, out_buf: bytearray,
+                       speed: float, brightness: int,
+                       r: int, g: int, b: int,
+                       r2: int, g2: int, b2: int,
+                       tail: int, fire_sim: "FireEffect"):
+    """Render selected effect directly into out_buf as packed RGB bytes."""
+    n3 = led_count * 3
+
+    if effect == "solid":
+        for i in range(0, n3, 3):
+            out_buf[i] = r
+            out_buf[i + 1] = g
+            out_buf[i + 2] = b
+        return
+
+    if effect == "breathing":
+        phase = (math.sin(t_rel * speed * math.tau) + 1.0) / 2.0
+        scale = phase * (brightness / 255.0)
+        rr = int(r * scale)
+        gg = int(g * scale)
+        bb = int(b * scale)
+        for i in range(0, n3, 3):
+            out_buf[i] = rr
+            out_buf[i + 1] = gg
+            out_buf[i + 2] = bb
+        return
+
+    if effect == "gradient":
+        off = (t_rel * speed) % 1.0
+        for i in range(led_count):
+            x = ((i / led_count) + off) % 1.0
+            j = i * 3
+            out_buf[j] = int(r * (1 - x) + r2 * x)
+            out_buf[j + 1] = int(g * (1 - x) + g2 * x)
+            out_buf[j + 2] = int(b * (1 - x) + b2 * x)
+        return
+
+    if effect == "chase":
+        for i in range(n3):
+            out_buf[i] = 0
+        pos = int((t_rel * speed * led_count) % led_count)
+        bv = brightness / 255.0
+        for k in range(tail):
+            idx = (pos - k) % led_count
+            fade = (1.0 - k / tail) * bv
+            j = idx * 3
+            out_buf[j] = int(r * fade)
+            out_buf[j + 1] = int(g * fade)
+            out_buf[j + 2] = int(b * fade)
+        return
+
+    if effect == "fire" and fire_sim is not None:
+        fire_sim.step()
+        pixels = fire_sim.render()
+        for i, (rr, gg, bb) in enumerate(pixels):
+            j = i * 3
+            out_buf[j] = rr
+            out_buf[j + 1] = gg
+            out_buf[j + 2] = bb
+        return
+
+    # rainbow (default)
+    bv = brightness / 255.0
+    for i in range(led_count):
+        rr, gg, bb = hsv_to_rgb(((t_rel * speed + i / led_count) % 1.0) * 360.0,
+                                1.0, bv)
+        j = i * 3
+        out_buf[j] = rr
+        out_buf[j + 1] = gg
+        out_buf[j + 2] = bb
 
 def unpack_packet(data: bytes):
     if len(data) != PACKET_SIZE:
@@ -211,7 +294,7 @@ class FireEffect:
 #  PUSH mode
 # ─────────────────────────────────────────────────────────────────────────────
 
-def push_pixels(port: int, fps: int, effect: str, led_count: int,
+def push_pixels(host: str, port: int, fps: int, effect: str, led_count: int,
                 speed: float, brightness: int,
                 r: int, g: int, b: int,
                 r2: int, g2: int, b2: int,
@@ -222,8 +305,10 @@ def push_pixels(port: int, fps: int, effect: str, led_count: int,
     overriding their locally-computed effect.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    dest = ("255.255.255.255", port)
+    if host == "255.255.255.255":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+    dest = (host, port)
 
     pkt_size = PIXEL_HDR_SIZE + led_count * 3
     if pkt_size > 1472:
@@ -231,7 +316,7 @@ def push_pixels(port: int, fps: int, effect: str, led_count: int,
             f"packet too large: {pkt_size}B (>1472B safe UDP payload). "
             f"Reduce --leds; current max is {(1472 - PIXEL_HDR_SIZE) // 3}."
         )
-    print(f"[pixel-push]  port={port}  effect={effect}  fps={fps}  "
+    print(f"[pixel-push]  host={host}  port={port}  effect={effect}  fps={fps}  "
           f"leds={led_count}  packet={pkt_size}B")
     print(f"  按 Ctrl+C 停止\n")
 
@@ -243,8 +328,11 @@ def push_pixels(port: int, fps: int, effect: str, led_count: int,
     next_tick = start
     stat_last = start
     stat_sent = 0
-    kw        = dict(speed=speed, brightness=brightness,
-                     r=r, g=g, b=b, r2=r2, g2=g2, b2=b2, tail=tail)
+    frame_buf = bytearray(led_count * 3)
+
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
 
     try:
         while True:
@@ -260,23 +348,11 @@ def push_pixels(port: int, fps: int, effect: str, led_count: int,
             t_rel  = t0 - start          # seconds since start
             frame_us = int(t_rel * 1_000_000)
 
-            if effect == "solid":
-                pixels = effect_solid(t_rel, led_count, **kw)
-            elif effect == "rainbow":
-                pixels = effect_rainbow(t_rel, led_count, **kw)
-            elif effect == "breathing":
-                pixels = effect_breathing(t_rel, led_count, **kw)
-            elif effect == "gradient":
-                pixels = effect_gradient(t_rel, led_count, **kw)
-            elif effect == "chase":
-                pixels = effect_chase(t_rel, led_count, **kw)
-            elif effect == "fire":
-                fire_sim.step()
-                pixels = fire_sim.render()
-            else:
-                pixels = effect_rainbow(t_rel, led_count, **kw)
+            render_frame_bytes(effect, t_rel, led_count, frame_buf,
+                               speed, brightness, r, g, b, r2, g2, b2,
+                               tail, fire_sim)
 
-            pkt = pack_pixel_packet(seq, frame_us, pixels)
+            pkt = pack_pixel_packet(seq, frame_us, frame_buf)
             sock.sendto(pkt, dest)
 
             stat_sent += 1
@@ -295,6 +371,8 @@ def push_pixels(port: int, fps: int, effect: str, led_count: int,
     except KeyboardInterrupt:
         print(f"\n  已停止，共发出 {seq} 帧像素数据  ({pkt_size}B/帧)。")
     finally:
+        if gc_was_enabled:
+            gc.enable()
         sock.close()
 
 def verify_sync_consistency(led_count: int = 462):
@@ -473,6 +551,8 @@ def main():
     # push
     p_push = sub.add_parser("push",
                              help="实时推送完整 LED 像素帧（Pixel Push 模式）")
+    p_push.add_argument("--host",       default="255.255.255.255",
+                        help="目标地址（默认广播 255.255.255.255，可填设备IP做单播）")
     p_push.add_argument("--port",       type=int,   default=12345)
     p_push.add_argument("--fps",        type=positive_int_arg, default=30,
                         help="目标帧率（default: 30）")
@@ -509,7 +589,7 @@ def main():
     elif args.cmd == "verify":
         verify_sync_consistency()
     elif args.cmd == "push":
-        push_pixels(args.port, args.fps, args.effect, args.leds,
+        push_pixels(args.host, args.port, args.fps, args.effect, args.leds,
                     args.speed, args.brightness,
                     args.r, args.g, args.b,
                     args.r2, args.g2, args.b2,
