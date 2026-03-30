@@ -240,12 +240,23 @@ def push_pixels(port: int, fps: int, effect: str, led_count: int,
     seq       = 0
     start     = time.monotonic()
     interval  = 1.0 / fps
+    next_tick = start
+    stat_last = start
+    stat_sent = 0
     kw        = dict(speed=speed, brightness=brightness,
                      r=r, g=g, b=b, r2=r2, g2=g2, b2=b2, tail=tail)
 
     try:
         while True:
-            t0     = time.monotonic()
+            now = time.monotonic()
+            if now < next_tick:
+                time.sleep(next_tick - now)
+                now = time.monotonic()
+            # If we are far behind schedule, resync to avoid burst-send jitter.
+            elif now - next_tick > interval * 2:
+                next_tick = now
+
+            t0     = now
             t_rel  = t0 - start          # seconds since start
             frame_us = int(t_rel * 1_000_000)
 
@@ -268,14 +279,18 @@ def push_pixels(port: int, fps: int, effect: str, led_count: int,
             pkt = pack_pixel_packet(seq, frame_us, pixels)
             sock.sendto(pkt, dest)
 
-            print(f"  → seq={seq:6d}  t={t_rel:8.3f}s  {len(pkt)}B",
-                  end="\r", flush=True)
+            stat_sent += 1
             seq += 1
+            next_tick += interval
 
-            elapsed = time.monotonic() - t0
-            wait    = interval - elapsed
-            if wait > 0:
-                time.sleep(wait)
+            # Throttled status output: per-frame print/flush causes host-side jitter.
+            if t0 - stat_last >= 1.0:
+                dt = t0 - stat_last
+                actual_fps = stat_sent / dt if dt > 0 else 0.0
+                print(f"  → seq={seq:6d}  t={t_rel:8.3f}s  {len(pkt)}B  fps={actual_fps:5.1f}",
+                    end="\r", flush=True)
+                stat_last = t0
+                stat_sent = 0
 
     except KeyboardInterrupt:
         print(f"\n  已停止，共发出 {seq} 帧像素数据  ({pkt_size}B/帧)。")
