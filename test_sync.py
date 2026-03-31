@@ -101,7 +101,7 @@ def render_frame_bytes(effect: str, t_rel: float, led_count: int, out_buf: bytea
                        speed: float, brightness: int,
                        r: int, g: int, b: int,
                        r2: int, g2: int, b2: int,
-                       tail: int, fire_sim: "FireEffect"):
+                       tail: int, gradient_width: int, fire_sim: "FireEffect"):
     """Render selected effect directly into out_buf as packed RGB bytes."""
     n3 = led_count * 3
 
@@ -126,8 +126,11 @@ def render_frame_bytes(effect: str, t_rel: float, led_count: int, out_buf: bytea
 
     if effect == "gradient":
         off = (t_rel * speed) % 1.0
+        w = gradient_width if gradient_width > 1 else 1
         for i in range(led_count):
-            x = ((i / led_count) + off) % 1.0
+            # Hold one gradient sample for W LEDs to widen the transition band.
+            idx = (i // w) * w
+            x = ((idx / led_count) + off) % 1.0
             j = i * 3
             out_buf[j] = int(r * (1 - x) + r2 * x)
             out_buf[j + 1] = int(g * (1 - x) + g2 * x)
@@ -228,12 +231,15 @@ def effect_breathing(t: float, led_count: int, speed: float,
 
 
 def effect_gradient(t: float, led_count: int, speed: float,
-                    r: int, g: int, b: int, r2: int, g2: int, b2: int, **_):
+                    r: int, g: int, b: int, r2: int, g2: int, b2: int,
+                    gradient_width: int = 10, **_):
     """Sweeping gradient between two colours."""
     off = (t * speed) % 1.0
+    w = gradient_width if gradient_width > 1 else 1
     pixels = []
     for i in range(led_count):
-        x = ((i / led_count) + off) % 1.0
+        idx = (i // w) * w
+        x = ((idx / led_count) + off) % 1.0
         pixels.append((int(r * (1 - x) + r2 * x),
                        int(g * (1 - x) + g2 * x),
                        int(b * (1 - x) + b2 * x)))
@@ -298,7 +304,7 @@ def push_pixels(host: str, port: int, fps: int, effect: str, led_count: int,
                 speed: float, brightness: int,
                 r: int, g: int, b: int,
                 r2: int, g2: int, b2: int,
-                tail: int, cooling: int, sparking: int):
+                tail: int, gradient_width: int, cooling: int, sparking: int):
     """
     Broadcast full 462-LED RGB frames at target FPS.
     Devices with fresh pixel data (< 500 ms old) will display it directly,
@@ -350,7 +356,7 @@ def push_pixels(host: str, port: int, fps: int, effect: str, led_count: int,
 
             render_frame_bytes(effect, t_rel, led_count, frame_buf,
                                speed, brightness, r, g, b, r2, g2, b2,
-                               tail, fire_sim)
+                               tail, gradient_width, fire_sim)
 
             pkt = pack_pixel_packet(seq, frame_us, frame_buf)
             sock.sendto(pkt, dest)
@@ -574,6 +580,8 @@ def main():
     p_push.add_argument("--b2",         type=uint8_arg, default=255, help="渐变终止色 B")
     p_push.add_argument("--tail",       type=min_one_int_arg, default=20,
                         help="chase 模式拖尾长度（default: 20）")
+    p_push.add_argument("--gradient-width", type=min_one_int_arg, default=10,
+                        help="gradient 模式每个颜色步进覆盖灯珠数（default: 10）")
     p_push.add_argument("--cooling",    type=uint8_arg, default=55,
                         help="fire 模式冷却速率（default: 55）")
     p_push.add_argument("--sparking",   type=uint8_arg, default=120,
@@ -593,7 +601,8 @@ def main():
                     args.speed, args.brightness,
                     args.r, args.g, args.b,
                     args.r2, args.g2, args.b2,
-                    args.tail, args.cooling, args.sparking)
+                    args.tail, args.gradient_width,
+                    args.cooling, args.sparking)
 
 if __name__ == "__main__":
     main()
