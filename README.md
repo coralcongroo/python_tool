@@ -98,6 +98,102 @@ python3 test_sync.py push --host 设备IP --effect gradient --fps 45 --leds 462
 
 ## 5. 渐变效果建议
 
+## 5. UDP 数据帧解析
+
+本工具涉及两类 UDP 负载：
+
+- 时间同步帧（LSYN）
+- 像素推送帧（LEPP）
+
+默认均为小端序（little-endian）。
+
+### 5.1 时间同步帧（LSYN）
+
+对应格式：`<IIqfBBBBB`
+
+- 总长度：25 字节
+- Magic：`0x4E59534C`（LSYN）
+
+字段定义：
+
+| 偏移 | 长度 | 类型 | 字段 |
+|---|---:|---|---|
+| 0  | 4 | u32 | magic |
+| 4  | 4 | u32 | seq |
+| 8  | 8 | i64 | master_us |
+| 16 | 4 | f32 | speed |
+| 20 | 1 | u8  | mode |
+| 21 | 1 | u8  | brightness |
+| 22 | 1 | u8  | color_r |
+| 23 | 1 | u8  | color_g |
+| 24 | 1 | u8  | color_b |
+
+在脚本中由 `PACKET_FMT = "<IIqfBBBBB"` 定义。
+
+### 5.2 像素推送帧（LEPP）
+
+对应格式：头部 `<IIqH` + 像素区 `led_count*3`。
+
+- 固定头长度：18 字节
+- Magic：`0x50504550`（LEPP）
+
+字段定义：
+
+| 偏移 | 长度 | 类型 | 字段 |
+|---|---:|---|---|
+| 0  | 4 | u32 | magic |
+| 4  | 4 | u32 | seq |
+| 8  | 8 | i64 | frame_us |
+| 16 | 2 | u16 | led_count |
+| 18 | N | bytes | rgb 数据（每灯 3 字节：R,G,B） |
+
+其中：
+
+- `N = led_count * 3`
+- 总长度 `= 18 + N`
+- 例如 `led_count=462` 时，总长度 `= 1404` 字节
+
+### 5.3 抓包快速判定方法
+
+1. 先看前 4 字节（小端 u32）
+2. 若为 `0x4E59534C`，按 LSYN 解析
+3. 若为 `0x50504550`，按 LEPP 解析
+4. LEPP 需校验：`实际长度 == 18 + led_count*3`
+
+### 5.4 最小解析示例（Python）
+
+```python
+import struct
+
+LSYN_MAGIC = 0x4E59534C
+LEPP_MAGIC = 0x50504550
+
+def parse_udp_payload(data: bytes):
+  if len(data) < 4:
+    return None
+  magic = struct.unpack_from("<I", data, 0)[0]
+
+  if magic == LSYN_MAGIC:
+    if len(data) != struct.calcsize("<IIqfBBBBB"):
+      return None
+    return {"type": "LSYN", "fields": struct.unpack("<IIqfBBBBB", data)}
+
+  if magic == LEPP_MAGIC:
+    if len(data) < 18:
+      return None
+    _, seq, frame_us, led_count = struct.unpack_from("<IIqH", data, 0)
+    expect = 18 + led_count * 3
+    if len(data) != expect:
+      return None
+    rgb = data[18:]
+    return {"type": "LEPP", "seq": seq, "frame_us": frame_us,
+        "led_count": led_count, "rgb_len": len(rgb)}
+
+  return None
+```
+
+## 6. 渐变效果建议
+
 如果使用 `gradient`：
 
 - 建议先用 `--fps 45`
@@ -115,7 +211,7 @@ python3 test_sync.py push \
   --leds 462
 ```
 
-## 6. 常见问题
+## 7. 常见问题
 
 ### 6.1 发送后灯无反应
 
@@ -145,7 +241,7 @@ python3 test_sync.py push \
 3. 调整 `--gradient-width`（例如 8、10、12）
 4. 确认设备端已启用队列+按 `frame_us` 对齐播放版本
 
-## 7. 快速命令集合
+## 8. 快速命令集合
 
 ```bash
 # 查看帮助
