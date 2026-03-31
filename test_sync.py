@@ -128,9 +128,8 @@ def render_frame_bytes(effect: str, t_rel: float, led_count: int, out_buf: bytea
         off = (t_rel * speed) % 1.0
         w = gradient_width if gradient_width > 1 else 1
         for i in range(led_count):
-            # Hold one gradient sample for W LEDs to widen the transition band.
-            idx = (i // w) * w
-            x = ((idx / led_count) + off) % 1.0
+            # Lower spatial frequency continuously (no hard block boundaries).
+            x = (((i / led_count) / w) + off) % 1.0
             j = i * 3
             out_buf[j] = int(r * (1 - x) + r2 * x)
             out_buf[j + 1] = int(g * (1 - x) + g2 * x)
@@ -238,8 +237,7 @@ def effect_gradient(t: float, led_count: int, speed: float,
     w = gradient_width if gradient_width > 1 else 1
     pixels = []
     for i in range(led_count):
-        idx = (i // w) * w
-        x = ((idx / led_count) + off) % 1.0
+        x = (((i / led_count) / w) + off) % 1.0
         pixels.append((int(r * (1 - x) + r2 * x),
                        int(g * (1 - x) + g2 * x),
                        int(b * (1 - x) + b2 * x)))
